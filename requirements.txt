@@ -1,0 +1,12 @@
+Flask
+mysql-connector-python
+python-dotenv
+pandas
+numpy
+scikit-learn
+scipy
+matplotlib
+opencv-python
+PyMuPDF
+requests
+

@@ -39,6 +39,24 @@
       color: #fff;
     }
 
+    /* Progress bar */
+    #progress-wrap {
+      width: 90%;
+      max-width: 1200px;
+      background: #111;
+      border-radius: 10px;
+      overflow: hidden;
+      margin-top: 16px;
+      border: 1px solid #333;
+    }
+    #progress-bar {
+      height: 12px;
+      width: 0%;
+      background: linear-gradient(90deg, #00d084, #4CAF50);
+      transition: width 0.3s ease;
+    }
+    #progress-text { color: #ccc; margin-top: 6px; font-size: 14px; text-align: right; width: 90%; max-width: 1200px; }
+
     #averages div {
       text-align: center;
     }
@@ -123,6 +141,10 @@
     <div>😰 Avg Stress<br><span id="avg-stress">Calculating...</span></div>
     <div>🫁 Avg SpO₂<br><span id="avg-spo2">Calculating...</span> %</div>
   </div>
+  <div id="progress-wrap">
+    <div id="progress-bar"></div>
+  </div>
+  <div id="progress-text">0% — 0s</div>
 
 
   <form action="/results" method="post" id="resultForm">
@@ -268,6 +290,12 @@
           spo2Chart.data.labels.push(now);
           spo2Chart.data.datasets[0].data.push(data.spo2);
           spo2Chart.update();
+
+          // Update progress UI
+          const pct = (data.progress || 0);
+          const elapsed = (data.elapsed_seconds || 0);
+          document.getElementById('progress-bar').style.width = pct + '%';
+          document.getElementById('progress-text').textContent = `${pct}% — ${elapsed}s`;
 
           if (data.scan_completed) {
             scanFinished = true;

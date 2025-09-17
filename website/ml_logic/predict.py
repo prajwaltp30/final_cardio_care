@@ -3,6 +3,9 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
 import mysql.connector
+from database.db import get_db_connection
+import numpy as np
+from scipy.signal import find_peaks
 
 # Load dataset
 df = pd.read_csv("heart_attack_prediction_dataset.csv")
@@ -103,10 +106,66 @@ def predict_manually(age, sex, heart_rate, diabetes, family_history, smoking, ob
 
 # Function to get user details from the database
 def get_user_details(email):
-    conn = mysql.connector.connect(user='root', password='dbms', host='localhost', database='cardio_care')
+    conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("SELECT age, sex, diabetes, famhistory, smoking, obesity, alcohol, exercise_hours, diet, heart_problem, bmi, physical_activity, sleep_hours, blood_pressure_systolic, blood_pressure_diastolic FROM user_details WHERE email = %s", (email,))
     user_details = cursor.fetchone()
     cursor.close()
     conn.close()
     return user_details
+
+# ------------------ Atherosclerosis Risk (SDPPG) ------------------
+def compute_atherosclerosis_risk(rppg_signal, fps: float = 15.0):
+    try:
+        signal = np.asarray(rppg_signal, dtype=np.float64)
+        if signal.size < 60:
+            return {"status": "insufficient", "message": "Not enough rPPG samples"}
+        signal = (signal - np.mean(signal)) / (np.std(signal) + 1e-8)
+        dppg = np.diff(signal)
+        sdppg = np.diff(dppg)
+        if sdppg.size < 30:
+            return {"status": "insufficient", "message": "Not enough SDPPG samples"}
+        norm_sd = (sdppg - np.mean(sdppg)) / (np.std(sdppg) + 1e-8)
+        peaks_pos, _ = find_peaks(norm_sd, distance=int(0.2*fps), prominence=0.05)
+        peaks_neg, _ = find_peaks(-norm_sd, distance=int(0.2*fps), prominence=0.05)
+        # Heuristic: choose top 5 by absolute amplitude within central region
+        all_peaks = np.concatenate([peaks_pos, peaks_neg])
+        if all_peaks.size < 3:
+            return {"status": "insufficient", "message": "Insufficient peaks"}
+        amps = norm_sd[all_peaks]
+        sort_idx = np.argsort(-np.abs(amps))
+        top_idx = all_peaks[sort_idx[:5]]
+        top_idx = np.sort(top_idx)
+        # Assign a,b,c,d,e by order
+        a_i = int(top_idx[0])
+        # find nearest negative after a for b
+        b_candidates = [p for p in top_idx[1:] if norm_sd[p] < 0]
+        e_candidates = [p for p in top_idx[1:] if norm_sd[p] > 0]
+        if not b_candidates or not e_candidates:
+            return {"status": "insufficient", "message": "Missing characteristic peaks"}
+        b_i = int(b_candidates[0])
+        e_i = int(e_candidates[-1])
+        a = float(norm_sd[a_i]); b = float(norm_sd[b_i]); e = float(norm_sd[e_i])
+        b_over_a = abs(b) / (abs(a) + 1e-8)
+        e_over_a = abs(e) / (abs(a) + 1e-8)
+        aging_index = (b - 0 - 0 - e) / (a + 1e-8)
+        flags = []
+        if b_over_a > 0.5:
+            flags.append("High reflected wave (b/a>0.5)")
+        if e_over_a < 1.0:
+            flags.append("Flattened late waveform (e/a<1.0)")
+        risk_level = "low"
+        if b_over_a > 0.6 or (b_over_a > 0.5 and e_over_a < 0.9) or aging_index < -0.2:
+            risk_level = "elevated"
+        if b_over_a > 0.8 or (b_over_a > 0.6 and e_over_a < 0.8):
+            risk_level = "high"
+        return {
+            "status": "ok",
+            "b_over_a": round(b_over_a, 3),
+            "e_over_a": round(e_over_a, 3),
+            "aging_index": round(float(aging_index), 3),
+            "risk_level": risk_level,
+            "notes": flags
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}

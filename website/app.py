@@ -2,12 +2,10 @@ from flask import Flask, request, jsonify, render_template, redirect, url_for, s
 import subprocess
 import os
 import numpy as np
-from appwrite.client import Client
-from appwrite.services.account import Account
-from appwrite.services.databases import Databases
-from appwrite.id import ID
+import mysql.connector
+from database.db import get_db_connection
 from database.save_user import save_user_data
-from ml_logic.predict import get_user_details, predict_manually
+from ml_logic.predict import get_user_details, predict_manually, compute_atherosclerosis_risk
 from io import BytesIO
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -16,15 +14,10 @@ from reportlab.lib.units import inch
 
 # Import from updated scan.py
 from opencv_scan.scan import generate_frames, get_live_data
+from opencv_scan.scan import get_rppg_signal
 
 app = Flask(__name__)
 app.secret_key = 'your_secret_key'  # Change this
-
-# Appwrite setupdownload_report
-client = Client()
-client.set_endpoint('https://cloud.appwrite.io/v1')
-client.set_project('667f8c85002229461ca8')
-client.set_key('[YOUR_API_KEY]')  # Replace with your API key
 
 # ---- ROUTES ----
 
@@ -39,37 +32,49 @@ def index():
 def signup():
     if request.method == 'POST':
         data = request.json
-        username = data['username']
-        email = data['email']
-        nickname = data['nickname']
-        password = data['password']
+        username = data.get('username')
+        email = data.get('email')
+        nickname = data.get('nickname')
+        password = data.get('password')
 
-        account = Account(client)
-        databases = Databases(client)
+        if not email or not password:
+            return jsonify({"message": "Email and password are required"}), 400
 
         try:
-            account.create(
-                user_id=ID.unique(),
-                email=email,
-                password=password,
-                name=username
-            )
-
-            databases.create_document(
-                database_id='667f8d010031471a488a',
-                collection_id='667f8d16003418fd93a2',
-                document_id=ID.unique(),
-                data={
-                    'email': email,
-                    'name': username,
-                    'nickname': nickname,
-                    'password': password,
-                }
-            )
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    email VARCHAR(255) UNIQUE,
+                    username VARCHAR(255),
+                    nickname VARCHAR(255),
+                    password VARCHAR(255)
+                )
+            """)
+            conn.commit()
+            # Upsert-like behavior: try insert, if exists update username/nickname/password
+            try:
+                cursor.execute(
+                    "INSERT INTO users (email, username, nickname, password) VALUES (%s, %s, %s, %s)",
+                    (email, username, nickname, password)
+                )
+                conn.commit()
+            except mysql.connector.errors.IntegrityError:
+                cursor.execute(
+                    "UPDATE users SET username=%s, nickname=%s, password=%s WHERE email=%s",
+                    (username, nickname, password, email)
+                )
+                conn.commit()
             return jsonify({"message": "User registered successfully"}), 200
-
         except Exception as e:
             return jsonify({"message": str(e)}), 400
+        finally:
+            try:
+                cursor.close()
+                conn.close()
+            except Exception:
+                pass
 
     return render_template('signup.html')
 
@@ -83,30 +88,26 @@ def login():
         if not email or not password:
             return jsonify({"success": False, "message": "Email and password are required"}), 400
 
-        databases = Databases(client)
         try:
-            result = databases.list_documents(
-                database_id='667f8d010031471a488a',
-                collection_id='667f8d16003418fd93a2'
-            )
-
-            user = None
-            for document in result['documents']:
-                if document['email'] == email:
-                    user = document
-                    break
-
-            if user is None:
+            conn = get_db_connection()
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT email, password FROM users WHERE email=%s", (email,))
+            user = cursor.fetchone()
+            if not user:
                 return jsonify({"success": False, "message": "Email not found"}), 404
-
             if user['password'] == password:
                 session['email'] = email
                 return jsonify({"success": True, "redirect": url_for('index')})
             else:
                 return jsonify({"success": False, "message": "Incorrect password"}), 401
-
         except Exception as e:
             return jsonify({"success": False, "message": str(e)}), 500
+        finally:
+            try:
+                cursor.close()
+                conn.close()
+            except Exception:
+                pass
 
     return render_template('login.html')
 
@@ -318,8 +319,13 @@ def predict():
         else:
             category = "Heart attack risk 1, heart attack risk percentage greater than 50. Don't be afraid. Just contact the nearest hospital. That's all."
 
+        # Compute atherosclerosis risk from captured rPPG
+        rppg = get_rppg_signal()
+        ath = compute_atherosclerosis_risk(rppg)
+
         return render_template('result.html', heart_attack_risk=predicted_heart_attack_risk,
-                               percentage=predicted_percentage, messages=messages, category=category)
+                               percentage=predicted_percentage, messages=messages, category=category,
+                               athero=ath)
     else:
         return render_template('ml.html')
 
@@ -471,6 +477,136 @@ def download_report():
         return "Method not allowed."
 
 
+
+# -------------- Integrated Chatbot (upload + chat) -----------------
+import fitz  # PyMuPDF
+import requests
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama3-70b-8192"
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+
+def extract_text_from_pdf(pdf_file):
+    text = ""
+    pdf = fitz.open(stream=pdf_file.read(), filetype="pdf")
+    for page in pdf:
+        text += page.get_text()
+    return text
+
+def ask_groq(prompt):
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a helpful health report assistant. Summarize simply."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.2
+    }
+    resp = requests.post(GROQ_API_URL, headers=headers, json=data)
+    if resp.status_code == 200:
+        return resp.json()["choices"][0]["message"]["content"]
+    return f"Groq error: {resp.text}"
+
+@app.route('/upload', methods=['POST'])
+def upload_pdf():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+    extracted_text = extract_text_from_pdf(file)
+    session['report_text'] = extracted_text
+    ai_response = ask_groq(f"Summarize and explain this health report:\n{extracted_text}")
+    return jsonify({"ai_response": ai_response})
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    user_message = request.json.get('message')
+    report_text = session.get('report_text')
+    if not report_text:
+        return jsonify({"error": "No report uploaded yet."}), 400
+    full_prompt = (
+        f"Given this health report:\n{report_text}\n\n"
+        f"Answer under 50 words: {user_message}"
+    )
+    ai_response = ask_groq(full_prompt)
+    return jsonify({"ai_response": ai_response})
+
+@app.route('/chatbot')
+def chatbot_page():
+    return render_template('chatbot.html')
+
+# -------------- Integrated Nearby Doctors -----------------
+from dotenv import load_dotenv
+load_dotenv()
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+@app.route('/nearby')
+def nearby_index():
+    return render_template('nearby_index.html', google_api_key=GOOGLE_API_KEY)
+
+@app.route('/nearby-doctors', methods=['POST'])
+def get_nearby_doctors():
+    data = request.get_json()
+    user_lat = data.get("lat")
+    user_lng = data.get("lng")
+    places_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+    places_params = {
+        "location": f"{user_lat},{user_lng}",
+        "radius": 3000,
+        "type": "doctor|hospital",
+        "key": GOOGLE_API_KEY
+    }
+    places_response = requests.get(places_url, params=places_params)
+    places_data = places_response.json()
+    results = places_data.get("results", [])
+    if not results:
+        return jsonify([])
+    destinations = [f"{p['geometry']['location']['lat']},{p['geometry']['location']['lng']}" for p in results]
+    matrix_url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    matrix_params = {
+        "origins": f"{user_lat},{user_lng}",
+        "destinations": "|".join(destinations),
+        "key": GOOGLE_API_KEY
+    }
+    matrix_response = requests.get(matrix_url, params=matrix_params)
+    distance_data = matrix_response.json()
+    for i, place in enumerate(results):
+        try:
+            place["distance_text"] = distance_data["rows"][0]["elements"][i]["distance"]["text"]
+            place["distance_value"] = distance_data["rows"][0]["elements"][i]["distance"]["value"]
+        except KeyError:
+            place["distance_text"] = "Unknown"
+            place["distance_value"] = float('inf')
+    sorted_places = sorted(results, key=lambda x: x["distance_value"])
+    doctors = []
+    for place in sorted_places:
+        loc = place["geometry"]["location"]
+        place_details_url = "https://maps.googleapis.com/maps/api/place/details/json"
+        place_details_params = {
+            "place_id": place["place_id"],
+            "fields": "name,formatted_phone_number,international_phone_number",
+            "key": GOOGLE_API_KEY
+        }
+        details_response = requests.get(place_details_url, params=place_details_params)
+        details_data = details_response.json()
+        phone_number = None
+        if details_data.get("result"):
+            phone_number = details_data["result"].get("international_phone_number")
+        doctors.append({
+            "name": place["name"],
+            "lat": loc["lat"],
+            "lng": loc["lng"],
+            "address": place.get("vicinity", ""),
+            "distance": place.get("distance_text", "Unknown"),
+            "rating": place.get("rating", "N/A"),
+            "phone": phone_number
+        })
+    return jsonify(doctors)
 
 if __name__ == '__main__':
     app.run(debug=True)

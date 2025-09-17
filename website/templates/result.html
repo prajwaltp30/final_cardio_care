@@ -133,6 +133,25 @@
             {% endfor %}
         </div>
 
+        {% if athero %}
+        <div class="messages">
+            <h2>🫀 Atherosclerosis (High-level) from Pulse Shape</h2>
+            {% if athero.status == 'ok' %}
+                <p>b/a: <span>{{ athero.b_over_a }}</span></p>
+                <p>e/a: <span>{{ athero.e_over_a }}</span></p>
+                <p>Aging Index: <span>{{ athero.aging_index }}</span></p>
+                <p>Risk Level: <span>{{ athero.risk_level|capitalize }}</span></p>
+                {% if athero.notes %}
+                {% for note in athero.notes %}
+                    <p>{{ note }}</p>
+                {% endfor %}
+                {% endif %}
+            {% else %}
+                <p>Pulse analysis unavailable: {{ athero.message }}</p>
+            {% endif %}
+        </div>
+        {% endif %}
+
         <div class="category category-{{ heart_attack_risk }}-{{ 'less' if percentage < 50 else 'greater' }}">
             <h2>🧠 You fall in this category:</h2>
             <p>{{ category }}</p>
@@ -153,8 +172,8 @@
                 <button type="submit">⬇️ Download Report</button>
                 
             </form>
-            <a id="dct" href="http://127.0.0.1:8080"><button>🏥📍Contact Nearby Doctors</button></a>    
-            <a href="http://127.0.0.1:5001/"><button>🏥📍Wanna Chat with Ai Doctor ?</button></a> 
+            <a id="dct" href="/nearby"><button>🏥📍Contact Nearby Doctors</button></a>    
+            <a href="/chatbot"><button>🏥📍Wanna Chat with Ai Doctor ?</button></a> 
 
         </div>
     </div>
